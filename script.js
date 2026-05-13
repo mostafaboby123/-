@@ -588,7 +588,7 @@ function printQuote() {
 }
 
 // ============================================================
-// PDF EXPORT
+// PDF EXPORT — Pure jsPDF (no html2canvas)
 // ============================================================
 
 async function downloadPDF() {
@@ -597,67 +597,266 @@ async function downloadPDF() {
   loadingEl.classList.remove('hidden');
 
   try {
-    const templateEl = document.getElementById('pdfTemplate');
-    templateEl.innerHTML = buildPrintHTML(true);
-    templateEl.style.display = 'block';
-    templateEl.style.position = 'fixed';
-    templateEl.style.top = '-9999px';
-    templateEl.style.left = '-9999px';
-    templateEl.style.width = '794px';
-    templateEl.style.zIndex = '-1';
+    await new Promise(r => setTimeout(r, 80)); // let spinner render
 
-    await new Promise(r => setTimeout(r, 300));
-
-    const canvas = await html2canvas(templateEl, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: '#ffffff',
-      width: 794,
-      windowWidth: 794,
-    });
-
-    const imgData = canvas.toDataURL('image/png');
     const { jsPDF } = window.jspdf;
-    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-    const pageW = pdf.internal.pageSize.getWidth();
-    const pageH = pdf.internal.pageSize.getHeight();
+    const pdf  = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pw   = 210;   // page width mm
+    const ph   = 297;   // page height mm
+    const ml   = 14;    // margin left
+    const mr   = 14;    // margin right
+    const cw   = pw - ml - mr;  // content width
 
-    // Scale image to fit A4
-    const imgAspect = canvas.height / canvas.width;
-    const pdfImgH   = pageW * imgAspect;
+    // ── helpers ──────────────────────────────────────────────
+    let y = 0;
 
-    if (pdfImgH <= pageH) {
-      pdf.addImage(imgData, 'PNG', 0, 0, pageW, pdfImgH);
-    } else {
-      // Multi-page support
-      let yOffset = 0;
-      const sliceH = Math.floor(canvas.width * (pageH / pageW));
-      while (yOffset < canvas.height) {
-        const sliceCanvas = document.createElement('canvas');
-        sliceCanvas.width  = canvas.width;
-        sliceCanvas.height = Math.min(sliceH, canvas.height - yOffset);
-        const ctx = sliceCanvas.getContext('2d');
-        ctx.drawImage(canvas, 0, yOffset, canvas.width, sliceCanvas.height, 0, 0, canvas.width, sliceCanvas.height);
-        const sliceData = sliceCanvas.toDataURL('image/png');
-        const sliceImgH = pageW * (sliceCanvas.height / canvas.width);
-        if (yOffset > 0) pdf.addPage();
-        pdf.addImage(sliceData, 'PNG', 0, 0, pageW, sliceImgH);
-        yOffset += sliceH;
-      }
+    function checkPageBreak(needed = 10) {
+      if (y + needed > ph - 14) { pdf.addPage(); y = 16; }
     }
 
-    const fileName = `عرض-سعر-${quoteNumber}-${companyData.companyName || 'شركة'}.pdf`;
+    function rect(x, yw, w, h, fillColor, strokeColor) {
+      if (fillColor)  { pdf.setFillColor(...fillColor);   pdf.rect(x, yw, w, h, 'F'); }
+      if (strokeColor){ pdf.setDrawColor(...strokeColor); pdf.rect(x, yw, w, h, 'S'); }
+    }
+
+    function text(str, x, yw, opts = {}) {
+      // jsPDF has basic RTL via align:'right' — we mirror x for RTL
+      pdf.text(String(str), x, yw, opts);
+    }
+
+    // jsPDF uses built-in fonts only (no Arabic shaping).
+    // We render Arabic via a canvas-per-text approach using the browser.
+    // Each Arabic string → small canvas → PNG → placed in PDF.
+    async function arabicImg(str, fontSizePt, fontWeight, color, maxWidthMm) {
+      const scale   = 3;
+      const pxPerMm = 3.7795 * scale;
+      const maxPx   = Math.round(maxWidthMm * pxPerMm);
+      const fSizePx = Math.round(fontSizePt * 1.333 * scale);
+
+      const cv  = document.createElement('canvas');
+      const ctx = cv.getContext('2d');
+      ctx.font  = `${fontWeight} ${fSizePx}px Tajawal, Arial`;
+
+      const measured = ctx.measureText(str).width;
+      cv.width  = Math.min(measured + 10, maxPx) || 10;
+      cv.height = fSizePx * 1.5;
+
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.font      = `${fontWeight} ${fSizePx}px Tajawal, Arial`;
+      ctx.fillStyle = color || '#000000';
+      ctx.direction = 'rtl';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText(str, cv.width - 2, fSizePx * 0.1, cv.width - 4);
+
+      return {
+        dataUrl : cv.toDataURL('image/png'),
+        widthMm : cv.width  / pxPerMm,
+        heightMm: cv.height / pxPerMm,
+      };
+    }
+
+    // Place Arabic image right-aligned inside [x, yw, w] box
+    async function placeAr(str, x, yw, widthMm, fontSizePt, fontWeight, color) {
+      if (!str) return;
+      const img = await arabicImg(str, fontSizePt, fontWeight, color, widthMm);
+      const ix  = x + widthMm - img.widthMm;   // right-align
+      pdf.addImage(img.dataUrl, 'PNG', ix, yw, img.widthMm, img.heightMm);
+    }
+
+    // Place Arabic image left-aligned (for LTR values like numbers/currency)
+    async function placeLtr(str, x, yw, widthMm, fontSizePt, fontWeight, color) {
+      if (!str) return;
+      const img = await arabicImg(str, fontSizePt, fontWeight, color, widthMm);
+      pdf.addImage(img.dataUrl, 'PNG', x, yw, img.widthMm, img.heightMm);
+    }
+
+    // ── HEADER BLOCK ─────────────────────────────────────────
+    y = 0;
+    // Navy rectangle
+    rect(0, 0, pw, 40, [15, 37, 64]);
+
+    // Gold bottom border line
+    pdf.setDrawColor(201, 162, 39);
+    pdf.setLineWidth(1.2);
+    pdf.line(0, 40, pw, 40);
+    pdf.setLineWidth(0.3);
+
+    // Company name (large, white)
+    await placeAr(companyData.companyName || 'اسم الشركة', ml, 4, cw * 0.55, 14, '900', '#ffffff');
+    // Subtitle
+    await placeAr('أحبار • برنترات • مستلزمات كمبيوتر', ml, 14, cw * 0.55, 7, '400', '#c9a227');
+
+    // Quote number + date (right side of header — left in PDF coordinates since we flip)
+    const qnImg = await arabicImg(quoteNumber, 10, '800', '#c9a227', 60);
+    pdf.addImage(qnImg.dataUrl, 'PNG', pw - mr - qnImg.widthMm, 5, qnImg.widthMm, qnImg.heightMm);
+    const dtImg = await arabicImg(formatDate(companyData.quoteDate), 7.5, '400', 'rgba(255,255,255,0.75)', 60);
+    pdf.addImage(dtImg.dataUrl, 'PNG', pw - mr - dtImg.widthMm, 13, dtImg.widthMm, dtImg.heightMm);
+
+    // Contact row
+    y = 43;
+    const contacts = [
+      `📞 هاتف: ${companyData.companyPhone || ''}`,
+      `📍 ${companyData.companyAddress || ''}`,
+      `👤 ${companyData.managerName || ''}`,
+      `📱 ${companyData.managerPhone || ''}`,
+    ];
+    // Render as 2 rows × 2 cols
+    const colW = cw / 2;
+    for (let i = 0; i < contacts.length; i++) {
+      const cx = ml + (i % 2 === 0 ? 0 : colW);
+      const cy = y + Math.floor(i / 2) * 6;
+      await placeAr(contacts[i], cx, cy, colW, 7.5, '400', '#2a4060');
+    }
+    y += 14;
+
+    // ── TITLE ────────────────────────────────────────────────
+    y += 4;
+    await placeAr('عرض سعر', ml, y, cw, 18, '900', '#1a3a5c');
+    y += 10;
+    // Gold divider
+    pdf.setDrawColor(201, 162, 39);
+    pdf.setLineWidth(1.5);
+    pdf.line(pw / 2 - 15, y, pw / 2 + 15, y);
+    pdf.setLineWidth(0.3);
+    y += 4;
+    await placeAr('موجّه إلى: جامعة بني سويف', ml, y, cw, 9, '700', '#5a6a7a');
+    y += 10;
+
+    // ── TABLE HEADER ─────────────────────────────────────────
+    const cols = {
+      num  : { x: ml,               w: 12  },
+      name : { x: ml + 12,          w: 74  },
+      qty  : { x: ml + 86,          w: 20  },
+      price: { x: ml + 106,         w: 38  },
+      total: { x: ml + 144,         w: 38  },
+    };
+
+    const rowH = 9;
+
+    // Header row fill
+    rect(ml, y, cw, rowH, [26, 58, 92]);
+
+    const hLabels = [
+      { col: 'num',   label: 'م' },
+      { col: 'name',  label: 'المنتج' },
+      { col: 'qty',   label: 'الكمية' },
+      { col: 'price', label: 'سعر القطعة' },
+      { col: 'total', label: 'الإجمالي' },
+    ];
+    for (const h of hLabels) {
+      const c = cols[h.col];
+      await placeAr(h.label, c.x, y + 1.5, c.w, 8, '700', '#ffffff');
+    }
+    y += rowH;
+
+    // ── TABLE ROWS ───────────────────────────────────────────
+    let grand = 0;
+    for (let i = 0; i < products.length; i++) {
+      checkPageBreak(rowH + 2);
+      const p      = products[i];
+      const uPrice = parseFloat(prices[p.id]) || 0;
+      const total  = uPrice * p.qty;
+      grand += total;
+
+      const rowFill = i % 2 === 0 ? [255,255,255] : [245,248,252];
+      rect(ml, y, cw, rowH, rowFill, [208, 220, 232]);
+
+      await placeAr(String(i + 1),                    cols.num.x,   y + 1.5, cols.num.w,   7.5, '700', '#5a6a7a');
+      await placeAr(p.name,                            cols.name.x,  y + 1.5, cols.name.w,  7.5, '500', '#1a2533');
+      await placeAr(String(p.qty),                     cols.qty.x,   y + 1.5, cols.qty.w,   7.5, '700', '#1a2533');
+      await placeLtr(uPrice > 0 ? formatCurrency(uPrice) : '—', cols.price.x, y + 1.5, cols.price.w, 7, '400', '#2a4060');
+      await placeLtr(uPrice > 0 ? formatCurrency(total)  : '—', cols.total.x, y + 1.5, cols.total.w, 7, '700', '#1a3a5c');
+
+      y += rowH;
+    }
+
+    // Grand total row
+    checkPageBreak(rowH + 2);
+    rect(ml, y, cw, rowH, [26, 58, 92], [15, 37, 64]);
+    await placeAr('الإجمالي الكلي', cols.num.x, y + 1.5, cols.num.w + cols.name.w + cols.qty.w + cols.price.w, 8, '800', '#ffffff');
+    await placeLtr(formatCurrency(grand), cols.total.x, y + 1.5, cols.total.w, 8, '800', '#c9a227');
+    y += rowH + 6;
+
+    // ── NOTES ────────────────────────────────────────────────
+    const notes = localStorage.getItem(LS_NOTES) || '';
+    const terms = localStorage.getItem(LS_TERMS) || '';
+
+    async function renderNotesBlock(label, content) {
+      if (!content.trim()) return;
+      checkPageBreak(20);
+      await placeAr(label, ml, y, cw, 9, '700', '#1a3a5c');
+      y += 6;
+      pdf.setDrawColor(208, 220, 232);
+      rect(ml, y, cw, 1, [208,220,232]);
+      y += 3;
+
+      // Word-wrap content into lines ~90 chars each
+      const lines = wrapText(content, 55);
+      for (const line of lines) {
+        checkPageBreak(7);
+        await placeAr(line, ml + 2, y, cw - 4, 8, '400', '#3a4a5a');
+        y += 6;
+      }
+      y += 4;
+    }
+
+    await renderNotesBlock('📝 ملاحظات', notes);
+    await renderNotesBlock('📋 شروط الدفع والتسليم', terms);
+
+    // ── SIGNATURE ────────────────────────────────────────────
+    checkPageBreak(30);
+    y += 4;
+    // const sigBoxW = cw / 3 - 4;
+    // const sigs = [
+    //   { label: 'ختم وتوقيع الشركة',      sub: companyData.companyName || '' },
+    //   { label: 'توقيع المسؤول',           sub: companyData.managerName || '' },
+    //   { label: 'اعتماد جامعة بني سويف',  sub: 'الختم الرسمي' },
+    // ];
+    // for (let i = 0; i < sigs.length; i++) {
+    //   const sx = ml + i * (sigBoxW + 6);
+    //   await placeAr(sigs[i].label, sx, y, sigBoxW, 7.5, '700', '#1a3a5c');
+    //   pdf.setDrawColor(26, 58, 92);
+    //   pdf.setLineWidth(0.8);
+    //   pdf.line(sx, y + 5, sx + sigBoxW, y + 5);
+    //   pdf.setLineWidth(0.3);
+    //   await placeAr(sigs[i].sub, sx, y + 20, sigBoxW, 7, '400', '#5a6a7a');
+    // }
+    y += 32;
+
+    // ── FOOTER ───────────────────────────────────────────────
+    pdf.setDrawColor(208, 220, 232);
+    pdf.line(ml, ph - 10, pw - mr, ph - 10);
+    await placeAr(quoteNumber + ' — ' + formatDate(companyData.quoteDate), ml, ph - 7, cw * 0.5, 6.5, '400', '#8a9aaa');
+    await placeAr('جامعة بني سويف — عرض سعر رسمي', ml + cw * 0.5, ph - 7, cw * 0.5, 6.5, '400', '#8a9aaa');
+
+    // ── SAVE ─────────────────────────────────────────────────
+    const fileName = `عرض-سعر-${quoteNumber}.pdf`;
     pdf.save(fileName);
 
   } catch (err) {
     console.error('PDF error:', err);
-    alert('حدث خطأ أثناء إنشاء ملف PDF. يرجى المحاولة مجدداً.');
+    alert('حدث خطأ أثناء إنشاء ملف PDF:\n' + err.message);
   } finally {
-    const templateEl = document.getElementById('pdfTemplate');
-    templateEl.style.display = 'none';
-    templateEl.innerHTML = '';
     loadingEl.classList.add('hidden');
   }
+}
+
+/** Simple word-wrap for Arabic text in PDF notes */
+function wrapText(str, maxChars) {
+  const words  = str.split(/\s+/);
+  const lines  = [];
+  let   current = '';
+  for (const w of words) {
+    if ((current + ' ' + w).trim().length > maxChars) {
+      if (current) lines.push(current.trim());
+      current = w;
+    } else {
+      current = (current + ' ' + w).trim();
+    }
+  }
+  if (current) lines.push(current.trim());
+  return lines.length ? lines : [str];
 }
 
 // ============================================================
@@ -851,6 +1050,595 @@ function buildPrintHTML(forPDF = false) {
 }
 
 // ============================================================
+// TOAST NOTIFICATIONS
+// ============================================================
+
+function showToast(message, type = 'info', duration = 3000) {
+  const container = document.getElementById('toastContainer');
+  const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span> ${message}`;
+  container.appendChild(toast);
+  setTimeout(() => {
+    toast.classList.add('hide');
+    setTimeout(() => toast.remove(), 350);
+  }, duration);
+}
+
+// ============================================================
+// ADMIN MENU MODAL (⋮ button on page 3)
+// ============================================================
+
+function openAdminMenuModal() {
+  document.getElementById('adminMenuPasswordInput').value = '';
+  document.getElementById('adminMenuError').classList.add('hidden');
+  document.getElementById('adminMenuModal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('adminMenuPasswordInput').focus(), 100);
+}
+
+function closeAdminMenuModal() {
+  document.getElementById('adminMenuModal').classList.add('hidden');
+}
+
+function verifyAdminMenuPassword() {
+  const input = document.getElementById('adminMenuPasswordInput').value;
+  if (input === ADMIN_PASSWORD) {
+    closeAdminMenuModal();
+    openAlamiaModal();
+  } else {
+    document.getElementById('adminMenuError').classList.remove('hidden');
+    document.getElementById('adminMenuPasswordInput').value = '';
+    document.getElementById('adminMenuPasswordInput').focus();
+    const box = document.querySelector('#adminMenuModal .modal-box');
+    box.style.animation = 'none';
+    box.offsetHeight;
+    box.style.animation = 'shake 0.4s ease';
+  }
+}
+
+// ============================================================
+// ALAMIA STORE STATE
+// ============================================================
+
+const LS_ALAMIA_PRICES = 'qs_alamia_prices';
+
+// Fixed branding for Al Alamia Store
+const ALAMIA_COMPANY = {
+  companyName:    'العالمية ستور',
+  companyAddress: 'مول سفنكس — المهندسين، الجيزة',
+  companyPhone:   '01140030112',
+  managerPhone:   '01114939714',
+  managerName:    'العالمية ستور',
+  quoteDate:      todayDate(),
+};
+
+let alamiaPrices = {};   // { productId: adjustedPrice }
+
+// ============================================================
+// ALAMIA MODAL — OPEN / CLOSE / RENDER
+// ============================================================
+
+function openAlamiaModal() {
+  // Clone current prices as starting point
+  alamiaPrices = {};
+  products.forEach(p => {
+    const orig = parseFloat(prices[p.id]) || 0;
+    alamiaPrices[p.id] = orig;
+  });
+
+  // Restore any saved alamia prices
+  const saved = localStorage.getItem(LS_ALAMIA_PRICES);
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    // Only apply if product IDs match
+    products.forEach(p => {
+      if (parsed[p.id] !== undefined) alamiaPrices[p.id] = parsed[p.id];
+    });
+  }
+
+  document.getElementById('alamiaModal').classList.remove('hidden');
+
+  // Set default mode to fixed
+  document.querySelector('input[name="alamiaMode"][value="fixed"]').checked = true;
+  document.getElementById('alamiaDiscount').value = 20;
+  document.getElementById('fixedDiscountArea').classList.remove('hidden');
+  document.getElementById('manualPricesArea').classList.add('hidden');
+
+  renderAlamiaManualTable();
+  updateAlamiaPreview();
+}
+
+function closeAlamiaModal() {
+  document.getElementById('alamiaModal').classList.add('hidden');
+}
+
+function onAlamiaModeChange() {
+  const mode = document.querySelector('input[name="alamiaMode"]:checked').value;
+  if (mode === 'fixed') {
+    document.getElementById('fixedDiscountArea').classList.remove('hidden');
+    document.getElementById('manualPricesArea').classList.add('hidden');
+  } else {
+    document.getElementById('fixedDiscountArea').classList.add('hidden');
+    document.getElementById('manualPricesArea').classList.remove('hidden');
+  }
+  updateAlamiaPreview();
+}
+
+// ============================================================
+// ALAMIA — MANUAL TABLE
+// ============================================================
+
+function renderAlamiaManualTable() {
+  const tbody = document.getElementById('alamiaPricesBody');
+  tbody.innerHTML = '';
+
+  products.forEach((p, i) => {
+    const currentPrice = alamiaPrices[p.id] ?? (parseFloat(prices[p.id]) || 0);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="col-num">${i + 1}</td>
+      <td style="font-size:0.82rem">${escapeHtml(p.name)}</td>
+      <td class="col-qty" style="text-align:center">${p.qty}</td>
+      <td class="col-price">
+        <input type="number" class="price-input" style="font-size:0.82rem"
+          value="${currentPrice}" min="0" step="0.01" placeholder="0.00"
+          data-id="${p.id}"
+          oninput="onAlamiaManualPriceChange(${p.id}, this.value)" />
+      </td>
+      <td class="col-total total-cell" id="alamia-total-${p.id}" style="font-size:0.82rem">
+        ${formatCurrency(currentPrice * p.qty)}
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  recalcAlamiaGrandTotal();
+}
+
+function onAlamiaManualPriceChange(id, value) {
+  const price = parseFloat(value) || 0;
+  alamiaPrices[id] = price;
+  const product = products.find(p => p.id === id);
+  if (product) {
+    const cell = document.getElementById(`alamia-total-${id}`);
+    if (cell) cell.textContent = formatCurrency(price * product.qty);
+  }
+  recalcAlamiaGrandTotal();
+  updateAlamiaPreview();
+}
+
+function recalcAlamiaGrandTotal() {
+  let grand = 0;
+  products.forEach(p => {
+    grand += (alamiaPrices[p.id] ?? 0) * p.qty;
+  });
+  const el = document.getElementById('alamiaGrandTotal');
+  if (el) el.textContent = formatCurrency(grand);
+}
+
+// ============================================================
+// ALAMIA — EFFECTIVE PRICES (considering mode)
+// ============================================================
+
+function getEffectiveAlamiaPrices() {
+  const mode     = document.querySelector('input[name="alamiaMode"]:checked').value;
+  const discount = parseFloat(document.getElementById('alamiaDiscount').value) || 0;
+  const result   = {};
+
+  products.forEach(p => {
+    const orig = parseFloat(prices[p.id]) || 0;
+    if (mode === 'fixed') {
+      result[p.id] = Math.max(0, orig - discount);
+    } else {
+      result[p.id] = alamiaPrices[p.id] ?? orig;
+    }
+  });
+
+  return result;
+}
+
+// ============================================================
+// ALAMIA — PREVIEW SUMMARY
+// ============================================================
+
+function updateAlamiaPreview() {
+  const effective = getEffectiveAlamiaPrices();
+  const mode      = document.querySelector('input[name="alamiaMode"]:checked').value;
+  const discount  = parseFloat(document.getElementById('alamiaDiscount').value) || 0;
+
+  let origGrand = 0;
+  let newGrand  = 0;
+  products.forEach(p => {
+    const orig = parseFloat(prices[p.id]) || 0;
+    origGrand += orig * p.qty;
+    newGrand  += (effective[p.id] ?? 0) * p.qty;
+  });
+
+  const saved    = origGrand - newGrand;
+  const previewEl = document.getElementById('alamiaPreview');
+
+  previewEl.innerHTML = `
+    <div class="preview-item">
+      <span class="preview-label">الإجمالي الأصلي</span>
+      <span class="preview-val" style="color:var(--text-muted);text-decoration:line-through">${formatCurrency(origGrand)}</span>
+    </div>
+    ${mode === 'fixed' ? `
+    <div class="preview-item">
+      <span class="preview-label">الخصم لكل منتج</span>
+      <span class="preview-val" style="color:var(--danger)">− EGP ${discount.toFixed(2)}</span>
+    </div>` : ''}
+    <div class="preview-item">
+      <span class="preview-label">إجمالي العالمية</span>
+      <span class="preview-val">${formatCurrency(newGrand)}</span>
+    </div>
+    ${saved > 0 ? `
+    <div class="preview-item">
+      <span class="preview-label">الفرق</span>
+      <span class="preview-val" style="color:var(--success)">− ${formatCurrency(saved)}</span>
+    </div>` : ''}
+  `;
+}
+
+// ============================================================
+// ALAMIA — GENERATE QUOTE (PDF or PRINT)
+// ============================================================
+
+async function generateAlamiaQuote(action) {
+  const effectivePrices = getEffectiveAlamiaPrices();
+
+  // Save alamia prices to LocalStorage (clone only)
+  localStorage.setItem(LS_ALAMIA_PRICES, JSON.stringify(effectivePrices));
+
+  // Generate a new quote number for alamia
+  const year    = new Date().getFullYear();
+  const stored  = JSON.parse(localStorage.getItem(LS_QUOTE_NUM) || '{"year":0,"seq":0}');
+  const newSeq  = stored.year === year ? stored.seq + 1 : 1;
+  localStorage.setItem(LS_QUOTE_NUM, JSON.stringify({ year, seq: newSeq }));
+  const alamiaQuoteNum = `Q-${year}-${String(newSeq).padStart(4, '0')}-A`;
+
+  const notes = localStorage.getItem(LS_NOTES) || '';
+  const terms = localStorage.getItem(LS_TERMS) || '';
+
+  closeAlamiaModal();
+
+  if (action === 'print') {
+    const win = window.open('', '_blank');
+    win.document.write(buildAlaminaPrintHTML(effectivePrices, alamiaQuoteNum, notes, terms));
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 600);
+    showToast('تم فتح نافذة الطباعة للعالمية ستور', 'success');
+  } else {
+    await generateAlamiaPDF(effectivePrices, alamiaQuoteNum, notes, terms);
+  }
+}
+
+// ============================================================
+// ALAMIA — PDF GENERATION (Pure jsPDF)
+// ============================================================
+
+async function generateAlamiaPDF(effectivePrices, alamiaQuoteNum, notes, terms) {
+  const loadingEl = document.getElementById('pdfLoading');
+  loadingEl.classList.remove('hidden');
+
+  try {
+    await new Promise(r => setTimeout(r, 80));
+
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pw  = 210, ph = 297, ml = 14, mr = 14;
+    const cw  = pw - ml - mr;
+
+    let y = 0;
+
+    function checkPageBreak(needed = 10) {
+      if (y + needed > ph - 14) { pdf.addPage(); y = 16; }
+    }
+
+    function rectA(x, yw, w, h, fillColor, strokeColor) {
+      if (fillColor)   { pdf.setFillColor(...fillColor);   pdf.rect(x, yw, w, h, 'F'); }
+      if (strokeColor) { pdf.setDrawColor(...strokeColor); pdf.rect(x, yw, w, h, 'S'); }
+    }
+
+    async function arabicImgA(str, fontSizePt, fontWeight, color, maxWidthMm) {
+      const scale   = 3;
+      const pxPerMm = 3.7795 * scale;
+      const maxPx   = Math.round(maxWidthMm * pxPerMm);
+      const fSizePx = Math.round(fontSizePt * 1.333 * scale);
+      const cv  = document.createElement('canvas');
+      const ctx = cv.getContext('2d');
+      ctx.font  = `${fontWeight} ${fSizePx}px Tajawal, Arial`;
+      const measured = ctx.measureText(str).width;
+      cv.width  = Math.min(measured + 10, maxPx) || 10;
+      cv.height = fSizePx * 1.5;
+      ctx.clearRect(0, 0, cv.width, cv.height);
+      ctx.font         = `${fontWeight} ${fSizePx}px Tajawal, Arial`;
+      ctx.fillStyle    = color || '#000000';
+      ctx.direction    = 'rtl';
+      ctx.textAlign    = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText(str, cv.width - 2, fSizePx * 0.1, cv.width - 4);
+      return { dataUrl: cv.toDataURL('image/png'), widthMm: cv.width / pxPerMm, heightMm: cv.height / pxPerMm };
+    }
+
+    async function placeArA(str, x, yw, widthMm, fontSizePt, fontWeight, color) {
+      if (!str) return;
+      const img = await arabicImgA(str, fontSizePt, fontWeight, color, widthMm);
+      pdf.addImage(img.dataUrl, 'PNG', x + widthMm - img.widthMm, yw, img.widthMm, img.heightMm);
+    }
+
+    async function placeLtrA(str, x, yw, widthMm, fontSizePt, fontWeight, color) {
+      if (!str) return;
+      const img = await arabicImgA(str, fontSizePt, fontWeight, color, widthMm);
+      pdf.addImage(img.dataUrl, 'PNG', x, yw, img.widthMm, img.heightMm);
+    }
+
+    // ── ALAMIA GOLD HEADER ──────────────────────────────────
+    // Gold gradient header (different from original navy)
+    rectA(0, 0, pw, 42, [20, 12, 0]);  // dark brown bg
+
+    // Gold accent bars
+    pdf.setFillColor(201, 162, 39);
+    pdf.rect(0, 0, 4, 42, 'F');
+    pdf.rect(pw - 4, 0, 4, 42, 'F');
+
+    pdf.setDrawColor(201, 162, 39);
+    pdf.setLineWidth(1.5);
+    pdf.line(4, 42, pw - 4, 42);
+    pdf.setLineWidth(0.3);
+
+    // Store icon area (gold circle)
+    rectA(ml, 5, 18, 18, [201, 162, 39]);
+    await placeArA('🏪', ml, 6, 18, 12, '400', '#ffffff');
+
+    // Store name
+    await placeArA('العالمية ستور', ml + 20, 4, cw * 0.5, 14, '900', '#c9a227');
+    await placeArA('مول سفنكس — المهندسين، الجيزة', ml + 20, 15, cw * 0.5, 7, '400', '#d4a830');
+
+    // Quote number top-left
+    const qnImg = await arabicImgA(alamiaQuoteNum, 9, '800', '#c9a227', 65);
+    pdf.addImage(qnImg.dataUrl, 'PNG', pw - mr - qnImg.widthMm, 5, qnImg.widthMm, qnImg.heightMm);
+    const dtImg = await arabicImgA(formatDate(ALAMIA_COMPANY.quoteDate), 7, '400', '#b89020', 65);
+    pdf.addImage(dtImg.dataUrl, 'PNG', pw - mr - dtImg.widthMm, 13, dtImg.widthMm, dtImg.heightMm);
+
+    // Contact row below header
+    y = 46;
+    const contacts = [
+      `📞 ${ALAMIA_COMPANY.companyPhone}`,
+      `📱 ${ALAMIA_COMPANY.managerPhone}`,
+      `📍 ${ALAMIA_COMPANY.companyAddress}`,
+    ];
+    for (let i = 0; i < contacts.length; i++) {
+      const cx = ml + i * (cw / 3);
+      await placeArA(contacts[i], cx, y, cw / 3, 7.5, '400', '#3a4a5a');
+    }
+    y += 10;
+
+    // ── TITLE ───────────────────────────────────────────────
+    y += 4;
+    await placeArA('عرض سعر', ml, y, cw, 18, '900', '#1a3a5c');
+    y += 10;
+    pdf.setDrawColor(201, 162, 39);
+    pdf.setLineWidth(1.5);
+    pdf.line(pw / 2 - 15, y, pw / 2 + 15, y);
+    pdf.setLineWidth(0.3);
+    y += 4;
+    await placeArA('موجّه إلى: جامعة بني سويف', ml, y, cw, 9, '700', '#5a6a7a');
+    y += 10;
+
+    // ── TABLE ───────────────────────────────────────────────
+    const cols = {
+      num  : { x: ml,      w: 12 },
+      name : { x: ml + 12, w: 74 },
+      qty  : { x: ml + 86, w: 20 },
+      price: { x: ml + 106,w: 38 },
+      total: { x: ml + 144,w: 38 },
+    };
+    const rowH = 9;
+
+    // Gold header row
+    rectA(ml, y, cw, rowH, [160, 125, 16]);
+    const hLabels = [
+      { col: 'num',   label: 'م' },
+      { col: 'name',  label: 'المنتج' },
+      { col: 'qty',   label: 'الكمية' },
+      { col: 'price', label: 'سعر القطعة' },
+      { col: 'total', label: 'الإجمالي' },
+    ];
+    for (const h of hLabels) {
+      const c = cols[h.col];
+      await placeArA(h.label, c.x, y + 1.5, c.w, 8, '700', '#ffffff');
+    }
+    y += rowH;
+
+    let grand = 0;
+    for (let i = 0; i < products.length; i++) {
+      checkPageBreak(rowH + 2);
+      const p      = products[i];
+      const uPrice = parseFloat(effectivePrices[p.id]) || 0;
+      const total  = uPrice * p.qty;
+      grand += total;
+
+      const rowFill = i % 2 === 0 ? [255,255,255] : [255,252,240];
+      rectA(ml, y, cw, rowH, rowFill, [208, 220, 232]);
+
+      await placeArA(String(i + 1), cols.num.x,   y + 1.5, cols.num.w,   7.5, '700', '#5a6a7a');
+      await placeArA(p.name,        cols.name.x,  y + 1.5, cols.name.w,  7.5, '500', '#1a2533');
+      await placeArA(String(p.qty), cols.qty.x,   y + 1.5, cols.qty.w,   7.5, '700', '#1a2533');
+      await placeLtrA(uPrice > 0 ? formatCurrency(uPrice) : '—', cols.price.x, y + 1.5, cols.price.w, 7, '400', '#2a4060');
+      await placeLtrA(uPrice > 0 ? formatCurrency(total)  : '—', cols.total.x, y + 1.5, cols.total.w, 7, '700', '#1a3a5c');
+      y += rowH;
+    }
+
+    // Grand total — gold style
+    checkPageBreak(rowH + 2);
+    rectA(ml, y, cw, rowH, [160, 125, 16], [100, 80, 0]);
+    await placeArA('الإجمالي الكلي', cols.num.x, y + 1.5,
+      cols.num.w + cols.name.w + cols.qty.w + cols.price.w, 8, '800', '#ffffff');
+    await placeLtrA(formatCurrency(grand), cols.total.x, y + 1.5, cols.total.w, 8, '800', '#ffffff');
+    y += rowH + 6;
+
+    // ── NOTES ───────────────────────────────────────────────
+    async function renderNotesBlockA(label, content) {
+      if (!content.trim()) return;
+      checkPageBreak(20);
+      await placeArA(label, ml, y, cw, 9, '700', '#1a3a5c');
+      y += 6;
+      rectA(ml, y, cw, 1, [208,220,232]);
+      y += 3;
+      const lines = wrapText(content, 55);
+      for (const line of lines) {
+        checkPageBreak(7);
+        await placeArA(line, ml + 2, y, cw - 4, 8, '400', '#3a4a5a');
+        y += 6;
+      }
+      y += 4;
+    }
+
+    await renderNotesBlockA('📝 ملاحظات', notes);
+    await renderNotesBlockA('📋 شروط الدفع والتسليم', terms);
+
+    // ── SIGNATURE ───────────────────────────────────────────
+    checkPageBreak(30);
+    y += 4;
+    const sigBoxW = cw / 3 - 4;
+
+    // for (let i = 0; i < sigs.length; i++) {
+    //   const sx = ml + i * (sigBoxW + 6);
+    //   await placeArA(sigs[i].label, sx, y, sigBoxW, 7.5, '700', '#1a3a5c');
+    //   pdf.setDrawColor(160, 125, 16);
+    //   pdf.setLineWidth(0.8);
+    //   pdf.line(sx, y + 5, sx + sigBoxW, y + 5);
+    //   pdf.setLineWidth(0.3);
+    //   await placeArA(sigs[i].sub, sx, y + 20, sigBoxW, 7, '400', '#5a6a7a');
+    // }
+
+    // ── FOOTER ──────────────────────────────────────────────
+    pdf.setDrawColor(201, 162, 39);
+    pdf.setLineWidth(0.6);
+    pdf.line(ml, ph - 10, pw - mr, ph - 10);
+    pdf.setLineWidth(0.3);
+    await placeArA(alamiaQuoteNum + ' — ' + formatDate(ALAMIA_COMPANY.quoteDate), ml, ph - 7, cw * 0.5, 6.5, '400', '#8a9aaa');
+    await placeArA('العالمية ستور — جامعة بني سويف', ml + cw * 0.5, ph - 7, cw * 0.5, 6.5, '400', '#8a9aaa');
+
+    const fileName = `عرض-سعر-العالمية-${alamiaQuoteNum}.pdf`;
+    pdf.save(fileName);
+    showToast('تم تحميل PDF العالمية ستور بنجاح ✨', 'success');
+
+  } catch (err) {
+    console.error('Alamia PDF error:', err);
+    showToast('خطأ في إنشاء PDF: ' + err.message, 'error');
+  } finally {
+    loadingEl.classList.add('hidden');
+  }
+}
+
+// ============================================================
+// ALAMIA — PRINT HTML
+// ============================================================
+
+function buildAlaminaPrintHTML(effectivePrices, alamiaQuoteNum, notes, terms) {
+  let grand = 0;
+  let rows  = '';
+  products.forEach((p, i) => {
+    const unitPrice = parseFloat(effectivePrices[p.id]) || 0;
+    const total     = unitPrice * p.qty;
+    grand += total;
+    rows += `
+      <tr>
+        <td style="text-align:center;padding:9px 10px;border:1px solid #d4a830;">${i + 1}</td>
+        <td style="padding:9px 14px;border:1px solid #d4a830;">${escapeHtml(p.name)}</td>
+        <td style="text-align:center;padding:9px 10px;border:1px solid #d4a830;">${p.qty}</td>
+        <td style="text-align:left;padding:9px 14px;border:1px solid #d4a830;">${unitPrice > 0 ? formatCurrency(unitPrice) : '—'}</td>
+        <td style="text-align:left;padding:9px 14px;border:1px solid #d4a830;font-weight:700;">${unitPrice > 0 ? formatCurrency(total) : '—'}</td>
+      </tr>`;
+  });
+
+  const dateFormatted = formatDate(ALAMIA_COMPANY.quoteDate);
+
+  return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head><meta charset="UTF-8"/>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'Tajawal',Arial,sans-serif;direction:rtl;background:#fff;color:#1a2533;margin:0 auto;padding:20px;max-width:794px;}
+  .page-wrap{padding:24px 32px;}
+  .header-strip{background:linear-gradient(135deg,#140c00,#2a1800);border-radius:10px;padding:20px 24px;color:#fff;margin-bottom:20px;border:2px solid #c9a227;border-right:6px solid #c9a227;}
+  .header-top{display:flex;justify-content:space-between;align-items:flex-start;}
+  .store-name{font-size:1.5rem;font-weight:900;color:#c9a227;}
+  .store-sub{font-size:0.78rem;color:rgba(255,255,255,0.6);margin-top:3px;}
+  .quote-info{text-align:left;}
+  .quote-num{font-size:0.95rem;font-weight:800;color:#c9a227;}
+  .quote-date{font-size:0.78rem;color:rgba(255,255,255,0.6);margin-top:3px;}
+  .contact-row{margin-top:12px;padding-top:10px;border-top:1px solid rgba(201,162,39,0.3);display:flex;gap:20px;flex-wrap:wrap;}
+  .contact-item{font-size:0.78rem;color:rgba(255,255,255,0.75);}
+  .title-section{text-align:center;margin:18px 0;}
+  .title-main{font-size:1.5rem;font-weight:900;color:#1a3a5c;}
+  .title-divider{width:80px;height:3px;background:linear-gradient(90deg,#c9a227,#e8c04a);margin:8px auto;border-radius:2px;}
+  .title-recipient{font-size:0.9rem;color:#5a6a7a;}
+  .title-recipient strong{color:#1a3a5c;}
+  table{width:100%;border-collapse:collapse;margin-bottom:18px;font-size:0.88rem;}
+  thead{background:linear-gradient(135deg,#a07d10,#c9a227);}
+  thead th{padding:11px 13px;text-align:right;font-weight:700;border:1px solid #8a6500;color:#fff;}
+  tbody tr:nth-child(even){background:#fffbef;}
+  tbody td{border:1px solid #d4a830;}
+  .grand-row{background:#1a3a5c!important;}
+  .grand-row td{color:#fff;font-weight:800;padding:11px 13px;border-color:#0f2540;}
+  .grand-val{text-align:left;color:#c9a227;}
+  .notes-box{background:#fffbef;border:1px solid #d4a830;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:0.85rem;color:#3a3010;line-height:1.7;}
+  .notes-label{font-weight:700;color:#a07d10;margin-bottom:6px;}
+  .sig-section{display:flex;justify-content:space-between;margin-top:28px;gap:16px;}
+  .sig-box{flex:1;text-align:center;font-size:0.78rem;color:#5a6a7a;}
+  .sig-box strong{display:block;color:#1a3a5c;margin-bottom:4px;}
+  .sig-line{border-top:1.5px solid #c9a227;margin-bottom:6px;margin-top:40px;}
+  .page-footer{margin-top:18px;padding-top:10px;border-top:1px solid #d4a830;display:flex;justify-content:space-between;font-size:0.72rem;color:#8a9aaa;}
+  @media print{body{padding:0;}}
+</style></head>
+<body><div class="page-wrap">
+  <div class="header-strip">
+    <div class="header-top">
+      <div>
+        <div class="store-name">🏪 العالمية ستور</div>
+        <div class="store-sub">مول سفنكس — المهندسين، الجيزة</div>
+      </div>
+      <div class="quote-info">
+        <div class="quote-num">${escapeHtml(alamiaQuoteNum)}</div>
+        <div class="quote-date">${dateFormatted}</div>
+      </div>
+    </div>
+    <div class="contact-row">
+      <div class="contact-item">📞 ${escapeHtml(ALAMIA_COMPANY.companyPhone)}</div>
+      <div class="contact-item">📱 ${escapeHtml(ALAMIA_COMPANY.managerPhone)}</div>
+      <div class="contact-item">📍 ${escapeHtml(ALAMIA_COMPANY.companyAddress)}</div>
+    </div>
+  </div>
+  <div class="title-section">
+    <div class="title-main">عرض سعر</div>
+    <div class="title-divider"></div>
+    <div class="title-recipient">موجّه إلى: <strong>جامعة بني سويف</strong></div>
+  </div>
+  <table>
+    <thead><tr>
+      <th style="width:50px;text-align:center">م</th>
+      <th>المنتج</th>
+      <th style="width:80px;text-align:center">الكمية</th>
+      <th style="width:150px;text-align:left">سعر القطعة</th>
+      <th style="width:150px;text-align:left">الإجمالي</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+    <tfoot><tr class="grand-row">
+      <td colspan="4" style="padding:11px 13px;text-align:right">الإجمالي الكلي</td>
+      <td class="grand-val" style="padding:11px 13px;text-align:left">${formatCurrency(grand)}</td>
+    </tr></tfoot>
+  </table>
+  ${notes ? `<div class="notes-box"><div class="notes-label">📝 ملاحظات</div>${escapeHtml(notes).replace(/\n/g,'<br/>')}</div>` : ''}
+  ${terms ? `<div class="notes-box"><div class="notes-label">📋 شروط الدفع والتسليم</div>${escapeHtml(terms).replace(/\n/g,'<br/>')}</div>` : ''}
+</div></body></html>`;
+}
+
+// ============================================================
 // KEYBOARD SHORTCUTS
 // ============================================================
 
@@ -859,11 +1647,17 @@ document.addEventListener('keydown', e => {
   if (!document.getElementById('adminModal').classList.contains('hidden') && e.key === 'Enter') {
     verifyAdminPassword();
   }
+  // Enter in admin menu modal → verify
+  if (!document.getElementById('adminMenuModal').classList.contains('hidden') && e.key === 'Enter') {
+    verifyAdminMenuPassword();
+  }
   // Escape → close modals
   if (e.key === 'Escape') {
     closeAdminModal();
     closeDeleteModal();
     closeClearModal();
+    closeAdminMenuModal();
+    closeAlamiaModal();
   }
 });
 
